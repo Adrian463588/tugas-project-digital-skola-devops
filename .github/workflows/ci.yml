@@ -1,0 +1,148 @@
+# Nama Workflow
+name: CI Pipeline (Lint, Test, Sonar, k6)
+
+# Pemicu (Trigger)
+on:
+  push:
+    branches: [sesi31-loadtest] # Sesuaikan dengan nama branch Anda
+  pull_request:
+    branches: [sesi31-loadtest] # Sesuaikan dengan nama branch Anda
+
+jobs:
+  # Job 1: Menjalankan ESLint
+  lint:
+    name: 1. ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm" # Menambahkan cache untuk instalasi lebih cepat
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  # Job 2: Menjalankan Unit Test (Jest)
+  unit-test:
+    name: 2. Unit Test (Jest)
+    runs-on: ubuntu-latest
+    needs: lint # Bergantung pada job 'lint'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests (with Coverage)
+        run: npm test
+
+      - name: Upload Coverage Report (Codecov)
+        # Job ini opsional jika Anda tidak pakai Codecov, tapi ada di file asli Anda
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/coverage-final.json
+          fail_ci_if_error: false # Sesuai file asli Anda
+
+      - name: Upload Coverage Artifact (for SonarQube)
+        # Meng-upload hasil coverage agar bisa dipakai oleh job sonarqube
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  # Job 3: Menjalankan SonarQube Scan
+  sonarqube-scan:
+    name: 3. SonarQube Scan
+    runs-on: ubuntu-latest
+    needs: unit-test # Bergantung pada job 'unit-test'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Diperlukan oleh SonarQube
+
+      - name: Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install Dependencies
+        # Tetap perlu install dependencies agar Sonar bisa menganalisis
+        run: npm ci
+
+      - name: Download Coverage Artifact
+        # Mengambil hasil coverage dari job 'unit-test'
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: SonarQube Scan
+        # Menjalankan scan. Tidak perlu 'npm test' lagi.
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # Sonar-scanner akan otomatis mencari laporan coverage di folder 'coverage'
+
+  # Job 4: Menjalankan k6 Smoke Test (Opsional)
+  k6-smoke-test:
+    name: 4. k6 Smoke Test
+    runs-on: ubuntu-latest
+    needs: unit-test # Bisa berjalan paralel dengan sonarqube
+    if: github.event_name == 'push' # Hanya berjalan saat di-push, tidak di PR
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Install k6
+        # Memindahkan instalasi k6 sebelum server
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start Application (in background)
+        run: npm start &
+        # Menambahkan 'env' di sini agar k6 bisa mengaksesnya
+        env:
+          BASE_URL: http://localhost:3000
+
+      - name: Wait for Server
+        # Script tunggu yang lebih robust
+        run: |
+          echo "Waiting for server to start at http://localhost:3000..."
+          timeout 30s bash -c 'until curl -s http://localhost:3000 > /dev/null; do echo -n "."; sleep 1; done'
+          echo "Server is up!"
+        # Penanganan error jika server gagal start
+        continue-on-error: false
+
+      - name: Run k6 Smoke Test
+        run: k6 run loadtest/script.js
+        env:
+          BASE_URL: http://localhost:3000
